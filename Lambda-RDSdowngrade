@@ -1,0 +1,107 @@
+import boto3
+import os
+from datetime import datetime, timedelta
+
+# Initialize AWS clients
+rds_client = boto3.client('rds')
+cloudwatch_client = boto3.client('cloudwatch')
+
+# Environment variables
+MAINTENANCE_WINDOW = os.environ.get('MAINTENANCE_WINDOW', 'Mon:00:00-Mon:03:00')
+TARGET_INSTANCE_CLASS = os.environ.get('TARGET_INSTANCE_CLASS', 'db.t3.small')
+CPU_THRESHOLD = float(os.environ.get('CPU_THRESHOLD', 20.0))  # Default: 20%
+
+def lambda_handler(event, context):
+    """
+    Lambda function to downgrade RDS instances when CPU utilization is low
+    and the current time is within the maintenance window.
+    """
+    # Get the list of RDS instances
+    instances = rds_client.describe_db_instances()['DBInstances']
+
+    for instance in instances:
+        instance_id = instance['DBInstanceIdentifier']
+        current_instance_class = instance['DBInstanceClass']
+
+        # Skip if the instance is already at the target class
+        if current_instance_class == TARGET_INSTANCE_CLASS:
+            print(f"Instance {instance_id} is already at the target class ({TARGET_INSTANCE_CLASS}). Skipping.")
+            continue
+
+        # Check CPU utilization
+        if is_cpu_utilization_low(instance_id):
+            # Check if the current time is within the maintenance window
+            if is_within_maintenance_window():
+                # Downgrade the instance
+                downgrade_instance(instance_id)
+            else:
+                print(f"Current time is outside the maintenance window. Skipping downgrade for {instance_id}.")
+        else:
+            print(f"CPU utilization is above the threshold for {instance_id}. Skipping downgrade.")
+
+def is_cpu_utilization_low(instance_id):
+    """
+    Check if the CPU utilization of the RDS instance is below the threshold.
+    """
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=10)  # Check the last 10 minutes
+
+    response = cloudwatch_client.get_metric_statistics(
+        Namespace='AWS/RDS',
+        MetricName='CPUUtilization',
+        Dimensions=[
+            {'Name': 'DBInstanceIdentifier', 'Value': instance_id}
+        ],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=300,  # 5-minute intervals
+        Statistics=['Average']
+    )
+
+    datapoints = response.get('Datapoints', [])
+    if not datapoints:
+        print(f"No CPU utilization data found for {instance_id}.")
+        return False
+
+    # Get the average CPU utilization
+    avg_cpu_utilization = datapoints[0]['Average']
+    print(f"Average CPU utilization for {instance_id}: {avg_cpu_utilization}%")
+
+    return avg_cpu_utilization < CPU_THRESHOLD
+
+def is_within_maintenance_window():
+    """
+    Check if the current time is within the maintenance window.
+    """
+    current_time = datetime.utcnow()
+    day_of_week = current_time.strftime('%a')
+    time_of_day = current_time.strftime('%H:%M')
+
+    start_day, start_time, end_day, end_time = parse_maintenance_window(MAINTENANCE_WINDOW)
+
+    if day_of_week == start_day and start_time <= time_of_day <= end_time:
+        return True
+    return False
+
+def parse_maintenance_window(window):
+    """
+    Parse the maintenance window string into start and end times.
+    """
+    start, end = window.split('-')
+    start_day, start_time = start.split(':')
+    end_day, end_time = end.split(':')
+    return start_day, start_time, end_day, end_time
+
+def downgrade_instance(instance_id):
+    """
+    Downgrade the RDS instance to the target instance class.
+    """
+    try:
+        response = rds_client.modify_db_instance(
+            DBInstanceIdentifier=instance_id,
+            DBInstanceClass=TARGET_INSTANCE_CLASS,
+            ApplyImmediately=True
+        )
+        print(f"Successfully downgraded instance {instance_id} to {TARGET_INSTANCE_CLASS}.")
+    except Exception as e:
+        print(f"Failed to downgrade instance {instance_id}: {e}")
